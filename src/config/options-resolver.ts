@@ -48,7 +48,11 @@ export class OptionsResolver {
 
         return {
             model: options.model,
-            source: { delegate: options.delegate, finder: options.findByFilter },
+            source: {
+                delegate: options.delegate,
+                finder: options.findByFilter,
+                relationLoadStrategy: options.relationLoadStrategy,
+            },
             input: OptionsResolver.buildInput(options, methods, legacy, searchable),
             output: OptionsResolver.buildOutput(),
             outputFormat: options.output ?? 'hal',
@@ -70,6 +74,8 @@ export class OptionsResolver {
                 )
                 : undefined,
             onQuery: options.onQuery,
+            onRecommendation: options.onRecommendation,
+            provider: options.provider ?? ProviderDetector.detect(options.delegate),
         };
     }
 
@@ -158,6 +164,10 @@ export class OptionsResolver {
                 relations: OptionsResolver.toSet(security.relations ?? []),
                 hidden,
                 maxDepth: security.maxDepth ?? 12,
+                maxInValues: security.maxInValues ?? 1000,
+                maxOrBranches: security.maxOrBranches ?? 50,
+                maxRelationRows: security.maxRelationRows,
+                maxFanout: security.maxFanout ?? 5000,
             };
         }
 
@@ -166,6 +176,10 @@ export class OptionsResolver {
             relations: OptionsResolver.toSet(security?.relations),
             hidden,
             maxDepth: security?.maxDepth ?? 12,
+            maxInValues: security?.maxInValues ?? 1000,
+            maxOrBranches: security?.maxOrBranches ?? 50,
+            maxRelationRows: security?.maxRelationRows,
+            maxFanout: security?.maxFanout ?? 5000,
         };
     }
 

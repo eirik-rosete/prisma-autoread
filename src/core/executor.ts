@@ -88,6 +88,11 @@ export class Executor {
             // With a cursor, skip the cursor row itself unless an explicit skip was set.
             if (spec.skip === undefined) args.skip = 1;
         }
+        // Opt-in only (requires Prisma's `relationJoins` preview feature); never
+        // set otherwise, and meaningless without a relation actually being loaded.
+        if (this.source.relationLoadStrategy && args.include) {
+            args.relationLoadStrategy = this.source.relationLoadStrategy;
+        }
         return args;
     }
 

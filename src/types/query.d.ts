@@ -32,6 +32,14 @@ export interface QuerySpec extends AggregationSpec {
     by?: string[];
     /** Group-by `having` clause. */
     having?: Record<string, any>;
+    /**
+     * Best-effort estimate of the row count this plan can materialise: the root
+     * `take` multiplied down every bounded to-many relation in `include`. Relations
+     * left unbounded (no `security.maxRelationRows` configured, no explicit `take`)
+     * are not counted, so this is a floor, not a hard ceiling. Metadata only — never
+     * sent to Prisma.
+     */
+    estimatedRows?: number;
 }
 
 /**
@@ -99,6 +107,24 @@ export interface ResolvedSecurity {
     hidden?: MaskNode;
     /** Maximum filter/include nesting depth. */
     maxDepth: number;
+    /** Maximum size of an `in`/`notIn` list before it is rejected with `400`. Defaults to 1000. */
+    maxInValues?: number;
+    /** Maximum number of branches in an `OR`/`AND` array before it is rejected with `400`. Defaults to 50. */
+    maxOrBranches?: number;
+    /**
+     * Ceiling (and, when a to-many relation's `include` omits `take`, the
+     * auto-injected default) for rows fetched per relation. `undefined` leaves
+     * nested collections exactly as before: unbounded unless the client passes an
+     * explicit `take`.
+     */
+    maxRelationRows?: number;
+    /**
+     * Ceiling on the estimated total row count of an `include` tree (root `take`
+     * multiplied down every bounded to-many relation). Only chains where every
+     * level's row count is known (explicit `take`, or the auto-injected default
+     * from `maxRelationRows`) are counted. Defaults to 5000.
+     */
+    maxFanout?: number;
 }
 
 /** Everything the builder needs beyond the model metadata. */

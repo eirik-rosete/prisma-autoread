@@ -4,6 +4,86 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-08-25
+
+Row-budget controls for deep/wide `include` trees — on by default this time, not
+just available — plus a query-shape advisory hook and opt-in relation-load batching.
+Read *Changed* before upgrading: this release caps a to-many relation's rows by
+default where 1.1.x always returned every row.
+
+### Added
+
+- **Per-relation `where`/`orderBy`/`take`/`skip`/`select` inside `include`.** Nested
+  collections could previously only be turned on (`include: { posts: true }`) —
+  there was no way to bound, filter or sort them independently of the root query.
+  Now every relation accepts the same controls Prisma itself does:
+
+  ```jsonc
+  { "include": {
+      "posts": {
+        "where": { "published": true },
+        "orderBy": [{ "createdAt": "desc" }],
+        "take": 20,
+        "include": { "comments": { "take": 5 } }
+      }
+  } }
+  ```
+
+  Same shape over the query string: `include[posts][take]=20&include[posts][where][published]=true`.
+  `take`/`skip`/`orderBy` on a to-one relation are rejected with `400` (Prisma has
+  no concept of paging a single record).
+
+- **`security.maxFanout`** (default `5000`, always on) — rejects an `include` tree
+  whose estimated row count (root `take` multiplied down every relation whose row
+  count is known — which, by default, is every relation) exceeds the budget, before
+  Prisma ever runs it.
+- **`security.maxInValues`** (default `1000`) and **`security.maxOrBranches`**
+  (default `50`, always on) — cap the size of an `in`/`notIn` list and the branch
+  count of an `OR`/`AND` array. Both are generous enough that no existing filter
+  should hit them.
+- **`QuerySpec.estimatedRows`** / **`QueryTelemetry.estimatedRows`** — the row
+  estimate used by `maxFanout`, surfaced through `onQuery` for dashboards.
+- **`onRecommendation`** — a new opt-in hook, independent of `onQuery`, that
+  analyses each request's own already-built plan against this endpoint's `security`
+  config and reports query-shape findings: a relation explicitly opted out of the
+  row budget, an estimate close to `maxFanout`, a large `in` list, a wide `OR`, an
+  unindexed `contains`, deep offset pagination that should be a cursor instead, and
+  a composite-index suggestion (`CREATE INDEX …`, skipped on MongoDB) synthesised
+  from the fields a request actually filters and sorts on. Computed only when the
+  hook is provided — nothing is measured against the database, and nothing is
+  aggregated across requests, so there is no new state to bound or leak. Never
+  reaches the HTTP response.
+- **`relationLoadStrategy`** (top-level option, `'join'` | `'query'`) — forwarded to
+  Prisma's `findMany` whenever `include` is present, for endpoints whose schema has
+  `previewFeatures = ["relationJoins"]` enabled and want to pin the relation-loading
+  strategy explicitly. Opt-in and inert otherwise: without the preview feature,
+  Prisma rejects the argument, so it is never sent unless you set it. (Without this
+  option at all, Prisma already loads relations via a second batched `WHERE IN`
+  query rather than a raw join or one query per row — this only matters once you
+  have opted into `relationJoins` yourself.)
+
+### Changed
+
+- **A to-many relation in `include` with no explicit `take` is now capped at
+  `defaults.limit` (`10` unless configured), instead of returning every matching
+  row.** This is `security.maxRelationRows`, and it is the one budget in this
+  release that is on by default rather than opt-in — the whole point of the row
+  budget is a parent with many children no longer fans out unbounded by default. An
+  explicit `take` on a relation is capped the same way. Set
+  `security.maxRelationRows` to size it deliberately, or to `Infinity` to restore
+  the old unbounded behaviour for a given endpoint.
+
+  **Upgrading:** audit any endpoint whose clients rely on an included collection
+  coming back in full, and set `security.maxRelationRows: Infinity` there (or a
+  number large enough for your data) before upgrading. Everything else about
+  `include` is unchanged.
+
+### Documentation
+
+- `docs/performance.md` and `docs/security.md` cover the new default row budget,
+  the nested `include` controls, `relationLoadStrategy` and `onRecommendation`,
+  each with an explicit upgrade note where behaviour changed.
+
 ## [1.1.2] - 2026-07-29
 
 Makes the cursor error say what a cursor *is*. No API changes.

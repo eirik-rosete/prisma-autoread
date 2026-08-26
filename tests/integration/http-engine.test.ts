@@ -173,3 +173,47 @@ describe('[Integration] createAutoRead – legacy dialect on GET', () => {
         expect(captured.args.where).toEqual({ age: 30 });
     });
 });
+
+describe('[Integration] createAutoRead – relationLoadStrategy', () => {
+    it('is not sent to Prisma unless configured', async () => {
+        const { app, captured } = buildApp();
+        await request(app).get('/users?include=enrolments');
+        expect(captured.args.relationLoadStrategy).toBeUndefined();
+    });
+
+    it('is forwarded only when include is present', async () => {
+        const { app, captured } = buildApp({ relationLoadStrategy: 'query' });
+        await request(app).get('/users?limit=5');
+        expect(captured.args.relationLoadStrategy).toBeUndefined();
+
+        await request(app).get('/users?include=enrolments');
+        expect(captured.args.relationLoadStrategy).toBe('query');
+    });
+});
+
+describe('[Integration] createAutoRead – onRecommendation', () => {
+    it('is never invoked unless configured', async () => {
+        const { app } = buildApp();
+        const res = await request(app).get('/users?filter%5Bfirstname%5D%5Bcontains%5D=al');
+        expect(res.status).toBe(200);
+        // No assertion possible on absence of calls without the hook — the point is
+        // this request must not throw or behave differently when it is unset.
+    });
+
+    it('fires for a request whose shape warrants a finding', async () => {
+        const found: any[] = [];
+        const { app } = buildApp({ onRecommendation: r => found.push(r) });
+        const res = await request(app).get('/users?filter%5Bfirstname%5D%5Bcontains%5D=al');
+        expect(res.status).toBe(200);
+        expect(found.some(r => r.code === 'unindexed-contains')).toBe(true);
+    });
+
+    it('reports estimatedRows via onQuery once include is present', async () => {
+        const telemetry: any[] = [];
+        const { app } = buildApp({ onQuery: t => telemetry.push(t) });
+        const res = await request(app).get('/users?include=enrolments&limit=5');
+        expect(res.status).toBe(200);
+        // root rows (5) + root rows * the relation's default take (defaults.limit = 10)
+        expect(telemetry[0].estimatedRows).toBe(5 + 5 * 10);
+    });
+});

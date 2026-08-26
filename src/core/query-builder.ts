@@ -17,13 +17,47 @@ import type {
 /** Nesting cap when no `security.maxDepth` is configured. */
 const DEFAULT_MAX_DEPTH = 12;
 
+/** Security defaults when the caller does not configure one at all (no `ctx.security`). */
+const DEFAULT_SECURITY: ResolvedSecurity = {
+    fields: '*',
+    relations: '*',
+    maxDepth: DEFAULT_MAX_DEPTH,
+};
+
+/** Budget defaults, applied in {@link QueryBuilder.build} regardless of where `security` came from. */
+const DEFAULT_MAX_IN_VALUES = 1000;
+const DEFAULT_MAX_OR_BRANCHES = 50;
+const DEFAULT_MAX_FANOUT = 5000;
+
+/** `ResolvedSecurity` with the budget fields defaulted, so the rest of the builder never sees `undefined`. */
+type NormalizedSecurity = ResolvedSecurity & {
+    maxInValues: number;
+    maxOrBranches: number;
+    maxFanout: number;
+    /**
+     * Always a concrete number: unset defaults to `ctx.defaults.limit`, so a
+     * to-many relation is bounded out of the box exactly like the root query
+     * already is. Pass `Infinity` explicitly to opt out and restore the old
+     * unbounded-unless-you-ask behaviour.
+     */
+    maxRelationRows: number;
+};
+
 /** Everything threaded through the recursive build. */
 interface BuildScope {
-    security: ResolvedSecurity;
+    security: NormalizedSecurity;
     jsonPathSyntax: JsonPathSyntax;
     /** Mask that applies at the current nesting level (`security.hidden`). */
     mask?: MaskNode;
 }
+
+/** Running total for {@link QueryBuilder.buildInclude}'s row-budget check. */
+interface FanoutBudget {
+    total: number;
+}
+
+/** Reserved keys inside an `include[relation]` object — everything else is a nested relation. */
+const INCLUDE_CONTROL_KEYS = new Set(['where', 'orderBy', 'take', 'skip', 'select']);
 
 /**
  * Turns a {@link RawSpec} (operator aliases, raw values) into a Prisma-ready
@@ -36,7 +70,20 @@ interface BuildScope {
  */
 export class QueryBuilder {
     static build(raw: RawSpec, model: ModelMeta, ctx: BuildContext): QuerySpec {
-        const security = ctx.security ?? { fields: '*', relations: '*', maxDepth: DEFAULT_MAX_DEPTH };
+        const supplied = ctx.security ?? DEFAULT_SECURITY;
+        // Callers (tests, advanced integrations) may build `ResolvedSecurity` by
+        // hand without the newer budget fields — default them here rather than
+        // requiring every call site to know about them. `maxRelationRows` in
+        // particular defaults to the request's own page size, so a to-many
+        // relation in `include` is bounded out of the box, the same as the root
+        // query already is — pass `Infinity` explicitly to opt back out.
+        const security: NormalizedSecurity = {
+            ...supplied,
+            maxInValues: supplied.maxInValues ?? DEFAULT_MAX_IN_VALUES,
+            maxOrBranches: supplied.maxOrBranches ?? DEFAULT_MAX_OR_BRANCHES,
+            maxFanout: supplied.maxFanout ?? DEFAULT_MAX_FANOUT,
+            maxRelationRows: supplied.maxRelationRows ?? ctx.defaults.limit,
+        };
         const scope: BuildScope = {
             security,
             jsonPathSyntax: ctx.jsonPathSyntax ?? 'array',
@@ -65,16 +112,23 @@ export class QueryBuilder {
             if (sortField) spec.orderBy = [{ [sortField]: ctx.defaults.order }];
         }
 
+        // Computed early (rather than after include) so the root `take` seeds the
+        // row-budget estimate below.
+        QueryBuilder.applyPagination(raw, spec, ctx, grouping);
+
         // Prisma forbids `select` and `include` together → select wins.
         if (raw.select) {
             spec.select = QueryBuilder.buildSelect(raw.select, model, scope);
         } else if (raw.include) {
-            const include = QueryBuilder.buildInclude(raw.include, model, scope, 0);
+            const fanout: FanoutBudget = { total: 0 };
+            const rootRows = Math.max(1, spec.take ?? 1);
+            const include = QueryBuilder.buildInclude(raw.include, model, scope, 0, rootRows, fanout);
             // Everything asked for may have been a composite (always returned anyway).
-            if (Object.keys(include).length > 0) spec.include = include;
+            if (Object.keys(include).length > 0) {
+                spec.include = include;
+                spec.estimatedRows = rootRows + fanout.total;
+            }
         }
-
-        QueryBuilder.applyPagination(raw, spec, ctx, grouping);
 
         if (raw.distinct) spec.distinct = QueryBuilder.fieldList(raw.distinct, model, scope, 'distinct');
         if (raw.cursor !== undefined && raw.cursor !== '') {
@@ -111,6 +165,11 @@ export class QueryBuilder {
                     out.NOT = QueryBuilder.buildWhere(value, model, scope, depth + 1);
                 } else {
                     const branches = Array.isArray(value) ? value : Object.values(value as any);
+                    if (branches.length > scope.security.maxOrBranches) {
+                        throw new BadRequest({
+                            msg: `Too many '${logical}' branches (${branches.length}); limit is ${scope.security.maxOrBranches} (security.maxOrBranches)`,
+                        });
+                    }
                     out[logical] = branches.map((sub: any) =>
                         QueryBuilder.buildWhere(sub, model, scope, depth + 1),
                     );
@@ -138,7 +197,7 @@ export class QueryBuilder {
             const field = QueryBuilder.resolveField(model, key, scope);
             out[field.name] = field.type === 'Json'
                 ? QueryBuilder.buildJson(value, scope.jsonPathSyntax)
-                : QueryBuilder.buildFieldCondition(value, field);
+                : QueryBuilder.buildFieldCondition(value, field, scope);
         }
 
         return out;
@@ -239,9 +298,13 @@ export class QueryBuilder {
         return mask === scope.mask ? scope : { ...scope, mask };
     }
 
-    private static buildFieldCondition(value: any, field: FieldMeta): any {
+    private static buildFieldCondition(value: any, field: FieldMeta, scope: BuildScope): any {
         if (value === null) return null;
-        if (Array.isArray(value)) return { in: ValueCoercer.fieldList(value, field) };
+        if (Array.isArray(value)) {
+            const list = ValueCoercer.fieldList(value, field);
+            QueryBuilder.assertListSize(list, scope.security.maxInValues, field.name);
+            return { in: list };
+        }
         if (typeof value !== 'object') return ValueCoercer.field(value, field);
 
         const condition: Record<string, any> = {};
@@ -254,7 +317,9 @@ export class QueryBuilder {
                 if (truthy) condition.equals = null;
                 else condition.not = null;
             } else if (OperatorRegistry.LIST_OPS.has(op)) {
-                condition[op] = ValueCoercer.fieldList(operand, field);
+                const list = ValueCoercer.fieldList(operand, field);
+                QueryBuilder.assertListSize(list, scope.security.maxInValues, field.name);
+                condition[op] = list;
             } else if (op === 'mode') {
                 condition.mode = operand;
             } else if (OperatorRegistry.PARTIAL_OPS.has(op)) {
@@ -263,7 +328,7 @@ export class QueryBuilder {
                 condition[op] = ValueCoercer.scalar(operand, field.type);
             } else if (op === 'not') {
                 condition.not = operand !== null && typeof operand === 'object'
-                    ? QueryBuilder.buildFieldCondition(operand, field)
+                    ? QueryBuilder.buildFieldCondition(operand, field, scope)
                     : ValueCoercer.field(operand, field);
             } else {
                 condition[op] = ValueCoercer.field(operand, field);
@@ -330,11 +395,26 @@ export class QueryBuilder {
         return out;
     }
 
+    /**
+     * Build a Prisma `include` tree, applying the row budget as it goes: every
+     * to-many relation gets a `take` — the client's own (capped at
+     * `security.maxRelationRows`), or that ceiling itself when the client left it
+     * out — and the running estimate of materialised rows (`multiplier`, the
+     * number of parent rows this branch hangs off) is checked against
+     * `security.maxFanout` so a handful of nested collections cannot multiply into
+     * hundreds of thousands of rows.
+     *
+     * `multiplier` only tracks branches whose row count is actually known — every
+     * relation, by default — so only a relation explicitly opted out of the budget
+     * (`security.maxRelationRows: Infinity`) is invisible to the estimate.
+     */
     private static buildInclude(
         include: any,
         model: ModelMeta,
         scope: BuildScope,
         depth: number,
+        multiplier: number,
+        fanout: FanoutBudget,
     ): Record<string, any> {
         if (depth > scope.security.maxDepth) throw new BadRequest({ msg: 'Include nesting too deep' });
         const out: Record<string, any> = {};
@@ -352,15 +432,109 @@ export class QueryBuilder {
                 throw new BadRequest({ msg: `Cannot include unknown relation '${key}' on ${model.name}` });
             }
             QueryBuilder.assertRelationAllowed(relation, scope.security);
-            if (value && typeof value === 'object' && !Array.isArray(value)) {
-                const related = DmmfRegistry.model(relation.target);
-                const inner = QueryBuilder.descend(scope, relation.name);
-                out[relation.name] = { include: QueryBuilder.buildInclude(value, related, inner, depth + 1) };
-            } else {
-                out[relation.name] = true;
-            }
+            out[relation.name] = QueryBuilder.buildIncludeNode(
+                relation, value, model, scope, depth, multiplier, fanout,
+            );
         }
         return out;
+    }
+
+    /** One relation's `include` entry: `true`/omitted, or a control object (`where`/`orderBy`/`take`/`skip`/`select`) plus further nested relations. */
+    private static buildIncludeNode(
+        relation: RelationMeta,
+        value: any,
+        model: ModelMeta,
+        scope: BuildScope,
+        depth: number,
+        multiplier: number,
+        fanout: FanoutBudget,
+    ): any {
+        const related = DmmfRegistry.model(relation.target);
+        const inner = QueryBuilder.descend(scope, relation.name);
+
+        if (value !== true && value != null && (typeof value !== 'object' || Array.isArray(value))) {
+            throw new BadRequest({ msg: `Include for relation '${relation.name}' expects true or an object` });
+        }
+        const control: Record<string, any> = value && typeof value === 'object' ? value : {};
+
+        if (!relation.isList && (control.take !== undefined || control.skip !== undefined || control.orderBy !== undefined)) {
+            throw new BadRequest({ msg: `'take'/'skip'/'orderBy' are not valid on to-one relation '${relation.name}'` });
+        }
+
+        const node: Record<string, any> = {};
+        if (control.where !== undefined) {
+            node.where = QueryBuilder.buildWhere(control.where, related, inner, depth + 1);
+        }
+        if (control.orderBy !== undefined) {
+            const list = Array.isArray(control.orderBy) ? control.orderBy : [control.orderBy];
+            node.orderBy = QueryBuilder.buildOrderBy(list, related, inner);
+        }
+
+        let childMultiplier = multiplier;
+        if (relation.isList) {
+            const effectiveTake = QueryBuilder.relationTake(control.take, scope);
+            // `Infinity` is the explicit "leave this relation unbounded" escape
+            // hatch (`security.maxRelationRows: Infinity`) — never a valid Prisma
+            // `take`, and not counted toward the fanout estimate either.
+            const bounded = Number.isFinite(effectiveTake);
+            if (bounded) node.take = effectiveTake;
+            if (control.skip !== undefined) node.skip = QueryBuilder.toNonNegativeInt(control.skip, 'skip');
+
+            if (bounded) {
+                const rows = multiplier * effectiveTake;
+                fanout.total += rows;
+                if (fanout.total > scope.security.maxFanout) {
+                    throw new BadRequest({
+                        msg: `Include plan too expensive: estimated ${Math.round(fanout.total)} rows across nested relations exceeds the limit of ${scope.security.maxFanout} (security.maxFanout). Add a smaller 'take' to nested relations, or raise the limit.`,
+                    });
+                }
+                childMultiplier = rows;
+            }
+        }
+
+        const nestedKeys = Object.fromEntries(
+            Object.entries(control).filter(([key]) => !INCLUDE_CONTROL_KEYS.has(key)),
+        );
+        if (control.select !== undefined) {
+            node.select = QueryBuilder.buildSelect(control.select, related, inner);
+        } else if (Object.keys(nestedKeys).length > 0) {
+            const nested = QueryBuilder.buildInclude(nestedKeys, related, inner, depth + 1, childMultiplier, fanout);
+            if (Object.keys(nested).length > 0) node.include = nested;
+        }
+
+        return Object.keys(node).length === 0 ? true : node;
+    }
+
+    /**
+     * Resolve the effective `take` for a to-many relation: an explicit `take` is
+     * capped at `security.maxRelationRows`, and an omitted one defaults to it —
+     * which, unless the endpoint overrides it, is the request's own page size
+     * (`ctx.defaults.limit`; see the normalisation in {@link QueryBuilder.build}).
+     * Pass `security.maxRelationRows: Infinity` to restore a fully unbounded
+     * relation; `relationTake` then returns `Infinity` and the caller treats that
+     * as "no `take`, don't count it toward the fanout budget".
+     */
+    private static relationTake(requested: any, scope: BuildScope): number {
+        if (requested !== undefined) {
+            return Math.min(QueryBuilder.toNonNegativeInt(requested, 'take'), scope.security.maxRelationRows);
+        }
+        return scope.security.maxRelationRows;
+    }
+
+    private static toNonNegativeInt(value: any, label: string): number {
+        const n = typeof value === 'number' ? value : parseInt(String(value), 10);
+        if (!Number.isFinite(n) || n < 0) {
+            throw new BadRequest({ msg: `Invalid '${label}' value '${value}': expected a non-negative integer` });
+        }
+        return n;
+    }
+
+    private static assertListSize(list: unknown[], max: number, field: string): void {
+        if (list.length > max) {
+            throw new BadRequest({
+                msg: `Too many values for '${field}' (${list.length}); limit is ${max} (security.maxInValues)`,
+            });
+        }
     }
 
     // ── pagination / aggregations ──────────────────────────────────────────────

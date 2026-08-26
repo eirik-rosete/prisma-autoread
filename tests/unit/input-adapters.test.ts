@@ -49,8 +49,9 @@ describe('QueryBracketsAdapter (GET)', () => {
             .toEqual([{ age: 'desc' }, { firstName: 'asc' }]);
         expect((await adapter.parse({ method: 'GET', query: { fields: 'id,firstName' } }, userCtx)).select)
             .toEqual({ id: true, firstName: true });
+        // `enrolments` is to-many, so it gets the default row budget (defaults.limit) unless configured.
         expect((await adapter.parse({ method: 'GET', query: { include: 'enrolments' } }, userCtx)).include)
-            .toEqual({ enrolments: true });
+            .toEqual({ enrolments: { take: 10 } });
     });
 
     it('parses pagination + search', async () => {

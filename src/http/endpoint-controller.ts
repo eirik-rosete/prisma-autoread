@@ -1,6 +1,7 @@
 import { Executor } from '../core/executor';
 import { DmmfRegistry } from '../core/dmmf/registry';
 import { RouteRegistry } from '../routes/route-registry';
+import { RecommendationEngine } from '../core/recommendations';
 import { NotImplementedError } from '../errors';
 import type { HttpRequestContext, HttpResponsePayload } from '../types/http';
 import type { RequestInput, QuerySpec } from '../types/query';
@@ -68,7 +69,15 @@ export class EndpointController {
             parseMs,
             execMs: Date.now() - execStarted,
             cacheHit,
+            estimatedRows: spec.estimatedRows,
         });
+
+        if (this.options.onRecommendation) {
+            const recommendations = RecommendationEngine.analyze(
+                spec, this.options.model, this.options.security, this.options.provider,
+            );
+            for (const recommendation of recommendations) this.options.onRecommendation(recommendation);
+        }
 
         return { status: 200, body: result.body, contentType: result.contentType };
     }

@@ -94,6 +94,28 @@ pathological payloads with `400`:
 filter[a][b][c][d][e][f][g][h][i][j][k][l][m]=1   → 400 Filter nesting too deep
 ```
 
+## Row budgets for `include` — on by default
+
+Depth alone does not stop a shallow `include` from being enormous: three to-many
+relations nested inside each other, each with a hundred rows, is a million rows at
+depth three. Two more `security` options bound the *size* of the tree, not just its
+shape — see [Performance](./performance.md#the-include-row-budget--on-by-default)
+for the full picture:
+
+```ts
+security: {
+    maxRelationRows: 100,  // ceiling + default `take` per relation (defaults.limit otherwise)
+    maxFanout: 5000,       // reject a plan estimated above this many total rows
+}
+```
+
+Unlike every other option on this page, `maxRelationRows` is **not** off by default:
+a to-many relation with no explicit `take` is bounded at `defaults.limit` even if you
+never touch `security`. Set it to `Infinity` to restore a fully unbounded relation.
+`maxFanout` (default `5000`) and the `in`/`OR` limits below it (`maxInValues`,
+`maxOrBranches`, defaults `1000`/`50`) are active out of the box too, generous enough
+that no reasonable request should notice them.
+
 ## Legacy dialect
 
 `legacy: true` (the default) drives the frozen 0.x middleware, which knows nothing
@@ -105,6 +127,12 @@ behave identically on both engines.
 > If you set `security.fields` *and* kept `legacy: true`, requests that used to pass
 > now return `400` — which was the configured intent all along. Widen the list if a
 > client legitimately needs a field.
+
+> **Upgrading from 1.1.x:** a to-many relation in `include` with no explicit `take`
+> now comes back capped at `defaults.limit` (`10` unless you configured it) instead
+> of every matching row. If a client genuinely needs the full collection, set
+> `security.maxRelationRows: Infinity` on that endpoint before upgrading — see
+> [Row budgets for `include`](#row-budgets-for-include--on-by-default).
 
 ## What is always enforced
 
@@ -122,3 +150,10 @@ behave identically on both engines.
 3. Put hashes, tokens and internal flags in `hidden`, not merely outside `fields` —
    only `hidden` keeps them out of the response body.
 4. Put authentication and rate limiting in front — this library does not do either.
+5. If the endpoint exposes any to-many relation through `include`, set
+   `security.maxRelationRows` to a size you actually chose, rather than leaning on
+   the `defaults.limit` fallback — see
+   [Row budgets for `include`](#row-budgets-for-include--on-by-default).
+6. Wire `onRecommendation` (see [Performance](./performance.md#query-shape-recommendations))
+   in non-production environments to catch unbounded relations, wide `OR`s and
+   unindexed `contains` filters while you still control the client code that sends them.

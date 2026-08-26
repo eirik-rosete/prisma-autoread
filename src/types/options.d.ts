@@ -2,8 +2,9 @@ import type { InputRegistry } from '../input/input-registry';
 import type { OutputRegistry } from '../output/output-registry';
 import type { PlanCache } from '../core/cache';
 import type { EngineDefaults, ResolvedSecurity, QuerySpec, JsonPathSyntax } from './query';
-import type { PrismaDelegate, FindByFilter, DatasourceProvider } from './prisma';
+import type { PrismaDelegate, FindByFilter, ExecutorSource, DatasourceProvider, RelationLoadStrategy } from './prisma';
 import type { KeywordMap, KeywordOverrides } from './keywords';
+import type { Recommendation } from './recommendations';
 
 export type RouteName = 'list' | 'count' | 'aggregate' | 'groupBy';
 
@@ -42,6 +43,28 @@ export interface SecurityOptions {
     hidden?: string[];
     /** Maximum filter/include nesting depth (default 12). */
     maxDepth?: number;
+    /** Maximum size of an `in`/`notIn` list (default 1000). */
+    maxInValues?: number;
+    /** Maximum number of `OR`/`AND` branches (default 50). */
+    maxOrBranches?: number;
+    /**
+     * Row budget for `include`, the single biggest lever against runaway nested
+     * reads: caps `take` on every to-many relation in `include`, and — this is the
+     * important part — auto-injects that cap when the client's `include` omits
+     * `take` altogether, so a to-many relation can no longer come back unbounded.
+     *
+     * Unset (the default) changes nothing: nested collections stay exactly as
+     * today, unbounded unless the client passes an explicit `take`. Set it once you
+     * are ready for that default to change — e.g. `maxRelationRows: 100`.
+     */
+    maxRelationRows?: number;
+    /**
+     * Ceiling on the estimated size of an `include` tree — root `take` multiplied
+     * down every to-many relation whose row count is known (explicit `take`, or the
+     * `maxRelationRows` default). Default `5000`; only bites once a request's own
+     * numbers multiply past it, so it does not require `maxRelationRows` to be set.
+     */
+    maxFanout?: number;
 }
 
 /** Timing/telemetry passed to the optional `onQuery` hook. */
@@ -55,6 +78,12 @@ export interface QueryTelemetry {
     execMs: number;
     /** Whether the query plan came from the cache. */
     cacheHit: boolean;
+    /**
+     * Best-effort estimate of rows this plan can materialise (see
+     * {@link QuerySpec.estimatedRows}). `undefined` for routes without a plan
+     * (nothing was built, or the route has no `include`).
+     */
+    estimatedRows?: number;
 }
 
 /** Public configuration accepted by `createAutoRead`. */
@@ -87,6 +116,13 @@ export interface AutoReadOptions {
     cache?: boolean | { max?: number };
     /** Telemetry hook invoked after each request with timing info. */
     onQuery?: (telemetry: QueryTelemetry) => void;
+    /**
+     * Query-shape advisory hook — computed per request, from that request's own
+     * plan and this endpoint's `security` config only (no database statistics, no
+     * state kept between requests). Unset by default: nothing is computed unless
+     * you provide it, and nothing here ever reaches the HTTP response.
+     */
+    onRecommendation?: (recommendation: Recommendation) => void;
     /** Rename reserved query parameters for this endpoint only. */
     keywords?: KeywordOverrides;
     /**
@@ -96,6 +132,15 @@ export interface AutoReadOptions {
     provider?: DatasourceProvider | string;
     /** Force the JSON `path` syntax, bypassing provider detection. */
     jsonPathSyntax?: JsonPathSyntax;
+    /**
+     * Forwarded to Prisma's `findMany` whenever `include` is used. Prisma already
+     * batches relation loads with a second `WHERE IN` query by default — this only
+     * matters if your schema has `previewFeatures = ["relationJoins"]` enabled and
+     * you want to pin the strategy explicitly (`'query'` keeps the batched
+     * behaviour, `'join'` opts into a single SQL join). Leave unset otherwise:
+     * without the preview feature, Prisma rejects the argument outright.
+     */
+    relationLoadStrategy?: RelationLoadStrategy;
 }
 
 export interface ResolvedRoute {
@@ -106,7 +151,7 @@ export interface ResolvedRoute {
 /** Fully-normalised options consumed by the HTTP layer. */
 export interface ResolvedOptions {
     model: string;
-    source: { delegate?: PrismaDelegate; finder?: FindByFilter };
+    source: ExecutorSource;
     input: InputRegistry;
     output: OutputRegistry;
     outputFormat: string;
@@ -120,4 +165,7 @@ export interface ResolvedOptions {
     basePathPrefix?: string;
     cache?: PlanCache<QuerySpec>;
     onQuery?: (telemetry: QueryTelemetry) => void;
+    onRecommendation?: (recommendation: Recommendation) => void;
+    /** Best-effort datasource provider (`'postgresql'`, `'mongodb'`, …), used to phrase index hints. */
+    provider?: string;
 }

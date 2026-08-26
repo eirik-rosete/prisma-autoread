@@ -275,6 +275,24 @@ GET /users?search=alice                  → OR-contains across `searchable` fie
 > `fields` (select) and `include` are mutually exclusive in Prisma — if both are
 > given, `select` wins.
 
+Every relation in `include` also accepts `where`, `orderBy`, `take`, `skip` and
+`select` — the same controls Prisma itself takes, so a nested collection can be
+filtered, sorted and bounded independently of the root query:
+
+```
+GET /users?include[posts][take]=20&include[posts][where][published]=true&include[posts][orderBy][createdAt]=desc
+```
+
+```jsonc
+// equivalent JSON body
+{ "include": { "posts": { "where": { "published": true }, "orderBy": [{ "createdAt": "desc" }], "take": 20 } } }
+```
+
+`take`/`skip`/`orderBy` are rejected with `400` on a to-one relation. A to-many
+relation with no explicit `take` is bounded automatically at `defaults.limit` — see
+[docs/performance.md](./docs/performance.md#the-include-row-budget--on-by-default)
+for the row budget that applies to the whole tree, and how to size or disable it.
+
 ---
 
 ## Pagination
@@ -352,11 +370,13 @@ createAutoRead(options): { applyTo(router): Router }
 | `formats` | | all | GET dialects when `legacy: false` (`query`/`rsql`/`odata`). |
 | `searchable` | | `[]` | Fields scanned by `?search=`. |
 | `defaults` | | `{limit:10,maxLimit:100,sort:'id',order:'asc'}` | Pagination/sort defaults. |
-| `security` | | allow all | `{ fields, relations, hidden, maxDepth }`. |
+| `security` | | allow all | `{ fields, relations, hidden, maxDepth, maxRelationRows, maxFanout, maxInValues, maxOrBranches }`. |
 | `keywords` | | defaults | Rename reserved query params (see below). |
 | `provider` / `jsonPathSyntax` | | auto | JSON `path` syntax; auto-detected from the datasource. |
 | `cache` | | off | `true` or `{ max }` — cache parsed query plans. |
-| `onQuery` | | — | Telemetry hook `(t) => void` with per-request timings. |
+| `onQuery` | | — | Telemetry hook `(t) => void` with per-request timings + `estimatedRows`. |
+| `onRecommendation` | | — | Opt-in query-shape advisory hook `(r) => void`. See [Performance](./docs/performance.md#query-shape-recommendations). |
+| `relationLoadStrategy` | | — | `'join'` \| `'query'`, forwarded to Prisma when `include` is used. Requires the `relationJoins` preview feature. See [Performance](./docs/performance.md#batching-relation-loads-relationloadstrategy). |
 | `basePathPrefix` | | `''` | Prefix inserted into generated links. |
 
 ### Renaming reserved parameters
@@ -397,10 +417,18 @@ createAutoRead({
         fields: ['id', 'firstName', 'email'], // only these are filterable/sortable/selectable
         relations: ['posts'],                 // only these can be traversed/included
         hidden: ['password', 'resetToken'],   // never queryable AND never returned
-        maxDepth: 5,                           // reject deeply-nested filters
+        maxDepth: 5,                          // reject deeply-nested filters
+        maxRelationRows: 100,                 // cap + auto-default `take` per relation in `include`
+        maxFanout: 5000,                      // reject an `include` tree estimated above this many rows
     },
 });
 ```
+
+`maxRelationRows` is on by default (`defaults.limit` unless set): a to-many relation
+in `include` with no explicit `take` is bounded even without touching `security` at
+all. Set it to size it deliberately, or to `Infinity` to restore a fully unbounded
+relation — see [docs/security.md](./docs/security.md#row-budgets-for-include--on-by-default)
+and [docs/performance.md](./docs/performance.md#the-include-row-budget--on-by-default).
 
 Anything outside the allow-list returns `400`. Omit `security` (or use `'*'`) to allow
 everything. The policy applies to every dialect, the legacy one included.

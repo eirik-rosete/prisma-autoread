@@ -15,6 +15,7 @@ export { OperatorRegistry } from './core/operators';
 export { FieldMask } from './core/mask';
 export { SpecGuard } from './core/spec-guard';
 export { PlanCache } from './core/cache';
+export { RecommendationEngine } from './core/recommendations';
 export { DmmfRegistry, ModelMeta } from './core/dmmf/registry';
 export { ValueCoercer } from './core/dmmf/coercer';
 
@@ -84,7 +85,8 @@ export type {
 export type { InputAdapter, AdapterContext, OutputAdapter, OutputContext } from './types/adapters';
 export type { FieldMeta, RelationMeta, CompositeMeta, ModelMetadata } from './types/dmmf';
 export type { KeywordMap, KeywordOverrides } from './types/keywords';
-export type { PrismaDelegate, FindByFilter, ExecutorSource, DatasourceProvider } from './types/prisma';
+export type { Recommendation, RecommendationLevel } from './types/recommendations';
+export type { PrismaDelegate, FindByFilter, ExecutorSource, DatasourceProvider, RelationLoadStrategy } from './types/prisma';
 export type {
     HttpRequestContext,
     HttpResponsePayload,
